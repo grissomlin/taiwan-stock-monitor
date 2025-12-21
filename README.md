@@ -25,7 +25,6 @@ A professional-grade, multi-market automated monitoring and data warehousing sys
 ### 🛠️ Key Features
 - **Rolling Window Logic**: Indicators are calculated based on **Rolling Trading Days (5D / 20D / 250D)** instead of calendar dates. This eliminates weekend/holiday gaps and ensures statistical continuity for **1,000-day high breakouts** and momentum backtesting.
 - **Parallel Matrix Strategy**: Utilizes GitHub Actions to run 6 independent market tasks simultaneously, reducing total runtime from 90 mins to **15 mins**.
-- **Historical Data Warehouse**: Supports initial full-history downloads (max/25y) into a centralized SQLite DB with optimized indexing.
 - **Resilient Pipeline**: Includes randomized jitter to prevent IP blocking and threshold guards to ensure data integrity.
 - **Smart Reporting**: Integrated **Resend API** for HTML reports featuring 10% return bins and direct technical chart links.
 
@@ -47,7 +46,6 @@ A professional-grade, multi-market automated monitoring and data warehousing sys
 ### 🛠️ 核心功能
 - **滾動交易日邏輯**：所有分析指標與矩陣均基於 **滾動交易日 (Rolling Trading Days)** 計算（5日/20日/250日），而非日曆日期。此方法排除了非交易日的干擾，確保留存數據在 **「千日新高」** 或動能回測中的統計連續性。
 - **平行矩陣策略 (Matrix Strategy)**：利用 GitHub Actions 同時啟動 6 台虛擬機並行運算，將總執行時間從 1.5 小時縮短至 **15 分鐘**。
-- **深度數據倉庫**：支援初次下載最高 25 年 (max) 的歷史數據，存入單一 SQLite 檔案並建立索引，優化長週期策略查詢速度。
 - **強韌下載管線**：內建隨機延遲 (Jitter) 防止 IP 封鎖，並具備數量門檻防護確保清單獲取完整。
 - **互動式報表**：整合 **Resend API**，自動生成包含 10% 報酬分箱圖表的 HTML 報表，並提供直達券商線圖的超連結。
 
