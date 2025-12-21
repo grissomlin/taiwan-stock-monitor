@@ -80,12 +80,10 @@ This project leverages the power of distributed computing provided by GitHub Act
 - **數據源**：Yfinance, Akshare, PyKRX, Tokyo-Stock-Exchange
 - **圖表引擎**：Matplotlib, Numpy
 - **報表發送**：Resend API
+![googlesheet1](image/6job1.png)
 
 
 ![googlesheet1](image/6job.png)
-
-
-![googlesheet1](image/6job1.png)
 
 
 ![googlesheet1](image/6job2.png)
