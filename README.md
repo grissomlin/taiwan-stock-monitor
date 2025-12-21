@@ -1,6 +1,5 @@
 # 🌍 Global Stock Multi-Matrix Monitor 
-### 全球股市六國矩陣監控與數據倉庫系統
-
+### 全球股市六國矩陣監控
 [![Build Status](https://github.com/你的帳號/global-stock-data-warehouse/actions/workflows/main.yml/badge.svg)](https://github.com/你的帳號/global-stock-data-warehouse/actions)
 [![Python Version](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
