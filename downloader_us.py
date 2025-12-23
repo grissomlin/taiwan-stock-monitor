@@ -13,10 +13,10 @@ MARKET_CODE = "us-share"
 DATA_SUBDIR = "dayK"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, DATA_SUBDIR)
-# 🚀 統一快取結構
 LIST_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, "lists")
 CACHE_LIST_PATH = os.path.join(LIST_DIR, "us_stock_list_cache.json")
 
+# ✅ 效能優化：5 個執行緒對美股而言是較穩定的選擇
 MAX_WORKERS = 5 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LIST_DIR, exist_ok=True)
@@ -32,10 +32,8 @@ def classify_security(name: str, is_etf: bool) -> str:
     return "Common Stock"
 
 def get_full_stock_list():
-    """
-    獲取美股清單，增加 3000 檔防呆門檻
-    """
-    threshold = 3000 # 美股普通股通常在 4000-6000 檔之間
+    """獲取美股清單，增加 3000 檔防呆門檻"""
+    threshold = 3000
     
     # 1. 檢查今日快取
     if os.path.exists(CACHE_LIST_PATH):
@@ -52,7 +50,6 @@ def get_full_stock_list():
     log("📡 開始從官網獲取美股普通股清單...")
     all_rows = []
 
-    # 嘗試獲取清單 (NASDAQ & NYSE)
     for site in ["nasdaqlisted.txt", "otherlisted.txt"]:
         try:
             url = f"https://www.nasdaqtrader.com/dynamic/symdir/{site}"
@@ -60,24 +57,20 @@ def get_full_stock_list():
             df = pd.read_csv(StringIO(r.text), sep="|")
             df = df[df["Test Issue"] == "N"]
             
-            # 欄位名稱校正 (Nasdaq 跟 Other 欄位名略有不同)
             sym_col = "Symbol" if site == "nasdaqlisted.txt" else "NASDAQ Symbol"
-            
             df["Category"] = df.apply(lambda row: classify_security(row["Security Name"], row["ETF"] == "Y"), axis=1)
-            # 過濾普通股
             valid_df = df[df["Category"] == "Common Stock"]
             
             for _, row in valid_df.iterrows():
                 ticker = str(row[sym_col]).strip().replace('$', '-')
                 name = str(row['Security Name']).strip()
                 all_rows.append(f"{ticker}&{name}")
-            time.sleep(1) # 兩次請求間稍微停頓
+            time.sleep(1) 
         except Exception as e:
             log(f"⚠️ {site} 獲取失敗: {e}")
 
     final_list = list(set(all_rows))
     
-    # 數量門檻檢查
     if len(final_list) >= threshold:
         with open(CACHE_LIST_PATH, "w", encoding="utf-8") as f:
             json.dump(final_list, f, ensure_ascii=False)
@@ -91,9 +84,8 @@ def get_full_stock_list():
     return final_list
 
 def download_stock_data(item):
-    """
-    單檔下載：具備隨機亂數與重試機制
-    """
+    """單檔下載：具備隨機亂數與重試機制"""
+    yf_tkr = "Unknown"
     try:
         yf_tkr, name = item.split('&', 1)
         safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '_', '-')]).strip()
@@ -102,8 +94,8 @@ def download_stock_data(item):
         if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
             return {"status": "exists", "tkr": yf_tkr}
 
-        # 🚀 下載前隨機等待 (Jitter)
-        time.sleep(random.uniform(0.5, 1.5))
+        # 🚀 下載前隨機等待，分散 GitHub Action 出口 IP 壓力
+        time.sleep(random.uniform(0.4, 1.2))
         tk = yf.Ticker(yf_tkr)
         
         for attempt in range(2):
@@ -112,25 +104,26 @@ def download_stock_data(item):
                 if hist is not None and not hist.empty:
                     hist.reset_index(inplace=True)
                     hist.columns = [c.lower() for c in hist.columns]
-                    # 移除時區
                     if 'date' in hist.columns:
                         hist['date'] = pd.to_datetime(hist['date'], utc=True).dt.tz_localize(None)
                     hist.to_csv(out_path, index=False, encoding='utf-8-sig')
                     return {"status": "success", "tkr": yf_tkr}
             except Exception as e:
                 if "Rate limited" in str(e):
-                    time.sleep(random.uniform(30, 60)) # 被限流時停更久
+                    time.sleep(random.uniform(20, 40))
             
-            # 失敗後隨機等待再重試
-            time.sleep(random.uniform(2, 5))
+            time.sleep(random.uniform(2, 4))
 
         return {"status": "empty", "tkr": yf_tkr}
     except:
         return {"status": "error"}
 
 def main():
+    start_time = time.time()
     items = get_full_stock_list()
-    if not items: return log("❌ 無法取得清單。")
+    if not items: 
+        log("❌ 無法取得清單。")
+        return {"total": 0, "success": 0, "fail": 0}
 
     log(f"🚀 開始美股下載任務 (共 {len(items)} 檔)")
     stats = {"success": 0, "exists": 0, "empty": 0, "error": 0}
@@ -144,7 +137,27 @@ def main():
             pbar.update(1)
         pbar.close()
     
-    log(f"📊 報告: 成功={stats['success']}, 已存在={stats['exists']}, 失敗={stats['error']}")
+    # --- 💡 數據下載統計 (供 Email 通知使用) ---
+    total_expected = len(items)
+    effective_success = stats['success'] + stats['exists']
+    fail_count = stats['error'] + stats['empty']
+
+    download_stats = {
+        "total": total_expected,
+        "success": effective_success,
+        "fail": fail_count
+    }
+
+    duration = (time.time() - start_time) / 60
+    log("="*30)
+    log(f"🏁 美股下載任務完成 (耗時 {duration:.1f} 分鐘)")
+    log(f"   - 總計標的: {total_expected}")
+    log(f"   - 下載成功: {effective_success}")
+    log(f"   - 失敗/缺失: {fail_count}")
+    log(f"📈 數據完整度: {(effective_success/total_expected)*100:.2f}%")
+    log("="*30)
+    
+    return download_stats # 🚀 回傳統計字典供主程式使用
 
 if __name__ == "__main__":
     main()
