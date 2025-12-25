@@ -1,205 +1,192 @@
 # -*- coding: utf-8 -*-
-import os, sys, time, random, logging, warnings, subprocess, json
-from pathlib import Path
+import os, sys, time, random, sqlite3, subprocess, io
+import pandas as pd
+import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-import pandas as pd
-import yfinance as yf
 
-# ====== 自動安裝必要套件 ======
-def ensure_pkg(pkg: str):
-    try:
-        __import__(pkg)
-    except ImportError:
-        print(f"🔧 正在安裝 {pkg}...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg])
-
-ensure_pkg("pykrx")
-from pykrx import stock as krx
-
-# ====== 降噪與環境設定 ======
-warnings.filterwarnings("ignore")
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
+# ========== 1. 環境判斷與參數設定 ==========
 MARKET_CODE = "kr-share"
-DATA_SUBDIR = "dayK"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, DATA_SUBDIR)
-LIST_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, "lists")
+DB_PATH = os.path.join(BASE_DIR, "kr_stock_warehouse.db")
 
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(LIST_DIR, exist_ok=True)
+# 💡 自動判斷環境：GitHub Actions 執行時此變數為 true
+IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
 
-# Checkpoint 檔案路徑
-MANIFEST_CSV = Path(LIST_DIR) / "kr_manifest.csv"
-LIST_ALL_CSV = Path(LIST_DIR) / "kr_list_all.csv"
-THREADS = 4 
+# ✅ 快取設定
+CACHE_DIR = os.path.join(BASE_DIR, "cache_kr")
+DATA_EXPIRY_SECONDS = 86400  # 本機快取效期：24小時
 
-# 💡 核心新增：數據過期時間 (3600 秒 = 1 小時)
-DATA_EXPIRY_SECONDS = 3600
+if not IS_GITHUB_ACTIONS and not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ✅ 效能設定：韓股對連線較敏感，MAX_WORKERS 不建議設太高
+MAX_WORKERS = 3 if IS_GITHUB_ACTIONS else 4 
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
 
-def map_symbol_kr(code: str, board: str) -> str:
-    """轉換為 Yahoo Finance 格式"""
-    suffix = ".KS" if board.upper() == "KS" else ".KQ"
-    return f"{str(code).zfill(6)}{suffix}"
+def ensure_pkg(pkg: str):
+    """確保必要套件已安裝"""
+    try:
+        __import__(pkg.replace('-', '_'))
+    except ImportError:
+        log(f"🔧 正在安裝 {pkg}...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-def standardize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """將 yfinance 原始資料標準化"""
-    if df is None or df.empty: return pd.DataFrame()
-    df = df.reset_index()
-    df.columns = [c.lower() for c in df.columns]
-    if 'date' not in df.columns: return pd.DataFrame()
+# ========== 2. 核心輔助函式 ==========
+
+def insert_or_replace(table, conn, keys, data_iter):
+    """防止重複寫入的核心 SQL 邏輯"""
+    sql = f"INSERT OR REPLACE INTO {table.name} ({', '.join(keys)}) VALUES ({', '.join(['?']*len(keys))})"
+    conn.executemany(sql, data_iter)
+
+def init_db():
+    """初始化資料庫結構"""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS stock_prices (
+                            date TEXT, symbol TEXT, open REAL, high REAL, 
+                            low REAL, close REAL, volume INTEGER,
+                            PRIMARY KEY (date, symbol))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS stock_info (
+                            symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, updated_at TEXT)''')
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_kr_stock_list():
+    """獲取韓股清單並同步更新名稱"""
+    ensure_pkg("finance-datareader")
+    import FinanceDataReader as fdr
     
-    # 移除時區
-    df['date'] = pd.to_datetime(df['date'], utc=True).dt.tz_localize(None)
-    req = ['date','open','high','low','close','volume']
-    return df[req] if all(c in df.columns for c in req) else pd.DataFrame()
+    log(f"📡 獲取韓股名單... (環境: {'GitHub' if IS_GITHUB_ACTIONS else 'Local'})")
+    try:
+        # 獲取韓國兩大交易所清單
+        df_kospi = fdr.StockListing('KOSPI')
+        df_kosdaq = fdr.StockListing('KOSDAQ')
+        df = pd.concat([df_kospi, df_kosdaq])
+        
+        conn = sqlite3.connect(DB_PATH)
+        stock_list = []
+        
+        for _, row in df.iterrows():
+            code = str(row['Code']).strip()
+            # Yahoo 格式：KOSPI(.KS), KOSDAQ(.KQ)
+            suffix = ".KS" if row['Market'] == 'KOSPI' else ".KQ"
+            symbol = f"{code}{suffix}"
+            name = row['Name']
+            sector = row.get('Sector', 'Unknown')
+            
+            conn.execute("INSERT OR REPLACE INTO stock_info (symbol, name, sector, updated_at) VALUES (?, ?, ?, ?)",
+                         (symbol, name, sector, datetime.now().strftime("%Y-%m-%d")))
+            stock_list.append((symbol, name))
+            
+        conn.commit()
+        conn.close()
+        log(f"✅ 成功同步韓股清單: {len(stock_list)} 檔")
+        return stock_list
+    except Exception as e:
+        log(f"❌ 韓股清單獲取失敗: {e}")
+        # 極簡備份名單
+        return [("005930.KS", "SAMSUNG ELECTRONICS"), ("000660.KS", "SK HYNIX")]
 
-def get_kr_list():
-    """從 KRX 獲取最新 KOSPI/KOSDAQ 清單"""
-    threshold = 2200 
-    max_retries = 3
+# ========== 3. 核心下載/快取分流邏輯 ==========
+
+def download_one(args):
+    symbol, name, mode = args
+    csv_path = os.path.abspath(os.path.join(CACHE_DIR, f"{symbol}.csv"))
+    start_date = "2020-01-01" if mode == 'hot' else "2000-01-03"
     
-    for i in range(max_retries):
-        log(f"📡 正在從 pykrx 獲取韓股清單 (第 {i+1} 次嘗試)...")
-        try:
-            today = pd.Timestamp.today().strftime("%Y%m%d")
-            lst = []
-            for mk, bd in [("KOSPI","KS"), ("KOSDAQ","KQ")]:
-                tickers = krx.get_market_ticker_list(today, market=mk)
-                for t in tickers:
-                    name = krx.get_market_ticker_name(t)
-                    lst.append({"code": t, "name": name, "board": bd})
+    # --- ⚡ 閃電快取分流 ---
+    if not IS_GITHUB_ACTIONS and os.path.exists(csv_path):
+        file_age = time.time() - os.path.getmtime(csv_path)
+        if file_age < DATA_EXPIRY_SECONDS:
+            return {"symbol": symbol, "status": "cache"}
+
+    try:
+        # 亞秒級隨機等待 (韓股較敏感，延遲稍微拉長)
+        time.sleep(random.uniform(0.5, 1.2))
+        
+        tk = yf.Ticker(symbol)
+        hist = tk.history(start=start_date, timeout=25, auto_adjust=False)
+        
+        if hist is None or hist.empty:
+            return {"symbol": symbol, "status": "empty"}
             
-            df = pd.DataFrame(lst)
-            if len(df) >= threshold:
-                log(f"✅ 成功獲取 {len(df)} 檔韓股清單")
-                df.to_csv(LIST_ALL_CSV, index=False, encoding='utf-8-sig')
-                return df
-        except Exception as e:
-            log(f"❌ 獲取清單失敗: {e}")
-        time.sleep(5)
+        hist.reset_index(inplace=True)
+        hist.columns = [c.lower() for c in hist.columns]
+        if 'date' in hist.columns:
+            # 移除時區並標準化
+            hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+        
+        df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+        df_final['symbol'] = symbol
+        
+        # 1. 存入本機 CSV 快取
+        if not IS_GITHUB_ACTIONS:
+            df_final.to_csv(csv_path, index=False)
 
-    if LIST_ALL_CSV.exists():
-        log("🔄 使用歷史清單快取作為備援...")
-        return pd.read_csv(LIST_ALL_CSV)
-    return pd.DataFrame([{"code":"005930","name":"三星電子","board":"KS"}])
+        # 2. 存入 SQL
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
+        conn.close()
+        
+        return {"symbol": symbol, "status": "success"}
+    except Exception:
+        return {"symbol": symbol, "status": "error"}
 
-def build_manifest(df_list):
-    """建立續跑清單，偵測檔案是否存在且是否在有效期內"""
-    # 如果 manifest 存在，讀取它，但我們會強制檢查檔案時效
-    if MANIFEST_CSV.exists():
-        mf = pd.read_csv(MANIFEST_CSV)
-        # 確保新股入列
-        new_items = df_list[~df_list['code'].astype(str).isin(mf['code'].astype(str))]
-        if not new_items.empty:
-            new_items = new_items.copy()
-            new_items['status'] = 'pending'
-            mf = pd.concat([mf, new_items], ignore_index=True)
-    else:
-        mf = df_list.copy()
-        mf["status"] = "pending"
+# ========== 4. 主流程 ==========
 
-    # 💡 智慧檢查：遍歷檔案，若檔案太舊則標記為 pending 重新下載
-    log("🔍 正在檢查數據時效性...")
-    for idx, row in mf.iterrows():
-        out_path = os.path.join(DATA_DIR, f"{row['code']}.{row['board']}.csv")
-        if os.path.exists(out_path):
-            file_age = time.time() - os.path.getmtime(out_path)
-            if file_age < DATA_EXPIRY_SECONDS:
-                mf.at[idx, "status"] = "done"
-            else:
-                mf.at[idx, "status"] = "pending" # 過期，需重抓
-        else:
-            mf.at[idx, "status"] = "pending"
-
-    mf.to_csv(MANIFEST_CSV, index=False)
-    return mf
-
-def download_one(row_tuple):
-    """單檔下載邏輯：強化版重試機制"""
-    idx, row = row_tuple
-    code, board = row['code'], row['board']
-    symbol = map_symbol_kr(code, board)
-    out_path = os.path.join(DATA_DIR, f"{code}.{board}.csv")
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # 隨機等待 0.4~1.0 秒以模擬真人
-            time.sleep(random.uniform(0.4, 1.0))
-            
-            tk = yf.Ticker(symbol)
-            df_raw = tk.history(period="2y", interval="1d", auto_adjust=True, timeout=20)
-            df = standardize_df(df_raw)
-            
-            if not df.empty:
-                df.to_csv(out_path, index=False)
-                return idx, "done"
-            
-            if attempt == max_retries - 1: return idx, "empty"
-        except Exception:
-            if attempt == max_retries - 1: return idx, "failed"
-            time.sleep(random.randint(2, 5))
-            
-    return idx, "failed"
-
-def main():
+def run_sync(mode='hot'):
     start_time = time.time()
-    log("🇰🇷 啟動韓股下載引擎 (時效檢查模式)")
+    init_db()
     
-    # 1. 獲取與建立清單
-    df_list = get_kr_list()
-    mf = build_manifest(df_list)
+    items = get_kr_stock_list()
+    if not items:
+        log("❌ 無法取得韓股名單，終止任務。")
+        return {"fail_list": [], "success": 0, "has_changed": False}
+
+    log(f"🚀 開始執行韓股 ({mode.upper()}) | 目標: {len(items)} 檔")
+
+    stats = {"success": 0, "cache": 0, "empty": 0, "error": 0}
+    fail_list = []
+    task_args = [(it[0], it[1], mode) for it in items]
     
-    # 2. 篩選需要抓取的標的 (pending 或 failed)
-    todo = mf[~mf["status"].isin(["done", "empty"])]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(download_one, arg): arg for arg in task_args}
+        pbar = tqdm(total=len(items), desc=f"KR處理中({mode})")
+        
+        for f in as_completed(futures):
+            res = f.result()
+            s = res.get("status", "error")
+            stats[s] += 1
+            if s == "error":
+                fail_list.append(res.get("symbol"))
+            pbar.update(1)
+        pbar.close()
+
+    # 💡 判斷變動標記
+    has_changed = stats['success'] > 0
     
-    if not todo.empty:
-        log(f"📝 待處理標的：{len(todo)} 檔 (其餘 {len(mf)-len(todo)} 檔在有效期內)")
-        with ThreadPoolExecutor(max_workers=THREADS) as executor:
-            futures = {executor.submit(download_one, item): item for item in todo.iterrows()}
-            pbar = tqdm(total=len(todo), desc="韓股下載進度")
-            
-            count = 0
-            try:
-                for f in as_completed(futures):
-                    idx, status = f.result()
-                    mf.at[idx, "status"] = status
-                    count += 1
-                    pbar.update(1)
-                    if count % 100 == 0: mf.to_csv(MANIFEST_CSV, index=False)
-            except KeyboardInterrupt:
-                log("🛑 中斷下載，儲存進度...")
-            finally:
-                mf.to_csv(MANIFEST_CSV, index=False)
-                pbar.close()
+    if has_changed or IS_GITHUB_ACTIONS:
+        log("🧹 偵測到變動或雲端環境，優化資料庫 (VACUUM)...")
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("VACUUM")
+        conn.close()
     else:
-        log("✅ 所有韓股資料皆在 1 小時內更新過，直接進入分析。")
-
-    # 📊 數據下載統計
-    total_expected = len(mf)
-    effective_success = len(mf[mf['status'] == 'done'])
-    fail_count = total_expected - effective_success
-
-    download_stats = {
-        "total": total_expected,
-        "success": effective_success,
-        "fail": fail_count
-    }
+        log("⏩ 韓股數據無變動，跳過 VACUUM。")
 
     duration = (time.time() - start_time) / 60
-    log("="*30)
-    log(f"🏁 韓股下載任務完成 (耗時 {duration:.1f} 分鐘)")
-    log(f"   - 下載成功(含有效期內): {effective_success}")
-    log(f"   - 數據完整度: {(effective_success/total_expected)*100:.2f}%")
-    log("="*30)
+    log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
+    log(f"✅ 新增: {stats['success']} | ⚡ 快取跳過: {stats['cache']} | ❌ 錯誤: {stats['error']}")
 
-    return download_stats
+    return {
+        "success": stats['success'] + stats['cache'],
+        "fail_list": fail_list,
+        "has_changed": has_changed
+    }
 
 if __name__ == "__main__":
-    main()
+    run_sync(mode='hot')

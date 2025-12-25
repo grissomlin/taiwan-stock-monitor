@@ -11,17 +11,17 @@ MARKET_CODE = "jp-share"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "jp_stock_warehouse.db")
 
-# 💡 自動判斷環境：GitHub Actions 會帶入此環境變數
+# 💡 自動判斷環境
 IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
 
-# ✅ 快取設定 (本機回測專用)
+# ✅ 快取設定
 CACHE_DIR = os.path.join(BASE_DIR, "cache_jp")
 DATA_EXPIRY_SECONDS = 86400  # 本機快取效期：24小時
 
 if not IS_GITHUB_ACTIONS and not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ✅ 效能設定：本機加速為 6 執行緒，GitHub 維持 4 以保穩定
+# ✅ 效能設定：本機加速為 6 執行緒
 MAX_WORKERS = 4 if IS_GITHUB_ACTIONS else 6 
 
 def log(msg: str):
@@ -94,22 +94,22 @@ def get_jp_stock_list():
         log(f"❌ 日股清單獲取失敗: {e}")
         return [("7203.T", "TOYOTA MOTOR")]
 
-# ========== 3. 核心下載/分流邏輯 ==========
+# ========== 3. 核心下載/快取分流邏輯 ==========
 
 def download_one(args):
     symbol, name, mode = args
     csv_path = os.path.abspath(os.path.join(CACHE_DIR, f"{symbol}.csv"))
     start_date = "2020-01-01" if mode == 'hot' else "1999-01-01"
     
-    # --- ⚡ 閃電快取：本機模式分流 ---
+    # --- ⚡ 閃電快取分流 ---
     if not IS_GITHUB_ACTIONS and os.path.exists(csv_path):
         file_age = time.time() - os.path.getmtime(csv_path)
         if file_age < DATA_EXPIRY_SECONDS:
             return {"symbol": symbol, "status": "cache"}
 
     try:
-        # 🏎️ 亞秒級隨機延遲，兼顧速度與風控
-        time.sleep(random.uniform(0.3, 0.9))
+        # 亞秒級隨機等待
+        time.sleep(random.uniform(0.2, 0.6))
         
         tk = yf.Ticker(symbol)
         hist = tk.history(start=start_date, timeout=25, auto_adjust=False)
@@ -120,7 +120,7 @@ def download_one(args):
         hist.reset_index(inplace=True)
         hist.columns = [c.lower() for c in hist.columns]
         if 'date' in hist.columns:
-            # 移除時區並格式化
+            # 移除時區並標準化格式
             hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
         
         df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
@@ -130,7 +130,7 @@ def download_one(args):
         if not IS_GITHUB_ACTIONS:
             df_final.to_csv(csv_path, index=False)
 
-        # 2. 存入 SQL (防重複)
+        # 2. 存入 SQL (使用防重複邏輯)
         conn = sqlite3.connect(DB_PATH, timeout=30)
         df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
         conn.close()
@@ -148,7 +148,7 @@ def run_sync(mode='hot'):
     items = get_jp_stock_list()
     if not items:
         log("❌ 無法取得名單，終止任務。")
-        return {"fail_list": [], "success": 0}
+        return {"fail_list": [], "success": 0, "has_changed": False}
 
     log(f"🚀 開始執行日股 ({mode.upper()}) | 目標: {len(items)} 檔")
 
@@ -169,19 +169,25 @@ def run_sync(mode='hot'):
             pbar.update(1)
         pbar.close()
 
-    # 優化空間
-    log("🧹 正在優化資料庫空間 (VACUUM)...")
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("VACUUM")
-    conn.close()
+    # 💡 判斷變動標記
+    has_changed = stats['success'] > 0
+    
+    if has_changed or IS_GITHUB_ACTIONS:
+        log("🧹 偵測到變動或雲端環境，優化資料庫 (VACUUM)...")
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("VACUUM")
+        conn.close()
+    else:
+        log("⏩ 日股數據無變動，跳過 VACUUM。")
 
     duration = (time.time() - start_time) / 60
-    log(f"📊 {MARKET_CODE} 同步完成！費時: {duration:.1f} 分鐘")
+    log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
     log(f"✅ 新增: {stats['success']} | ⚡ 快取跳過: {stats['cache']} | ❌ 錯誤: {stats['error']}")
 
     return {
         "success": stats['success'] + stats['cache'],
-        "fail_list": fail_list
+        "fail_list": fail_list,
+        "has_changed": has_changed
     }
 
 if __name__ == "__main__":
